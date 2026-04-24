@@ -1,0 +1,153 @@
+// 跨平台DHCP服务器（固定分配IP：192.168.1.2）
+#ifdef _WIN32
+    #define _WINSOCK_DEPRECATED_NO_WARNINGS
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+    #pragma comment(lib, "ws2_32.lib")
+    typedef int socklen_t;
+#else
+    #include <sys/socket.h>
+    #include <netinet/udp.h>
+    #include <arpa/inet.h>
+    #include <unistd.h>
+    #include <string.h>
+    #include <stdio.h>
+#endif
+
+#include <stdlib.h>
+
+// DHCP固定配置
+#define SERVER_IP     "192.168.1.100"   // 本服务器IP
+#define ASSIGN_IP     "192.168.1.2"     // 分配给客户端的固定IP
+#define NETMASK       "255.255.255.0"   // 子网掩码
+#define GATEWAY       "192.168.1.1"    // 网关
+#define DNS           "8.8.8.8"         // DNS服务器
+#define DHCP_SERVER_PORT  67            // 服务器端口
+#define DHCP_CLIENT_PORT  68            // 客户端端口
+
+// DHCP报文简化结构体
+struct dhcp_packet {
+    uint8_t op;         // 1=请求 2=响应
+    uint8_t htype;      // 硬件类型
+    uint8_t hlen;       // 硬件地址长度
+    uint8_t hops;
+    uint32_t xid;       // 事务ID
+    uint16_t secs;
+    uint16_t flags;
+    uint32_t ciaddr;    // 客户端IP
+    uint32_t yiaddr;    // 分配的IP（核心）
+    uint32_t siaddr;    // 服务器IP
+    uint32_t giaddr;
+    uint8_t chaddr[16]; // 客户端MAC
+    uint8_t sname[64];
+    uint8_t file[128];
+    uint8_t options[312];
+};
+
+// 发送DHCP响应（Offer/Ack）
+void send_dhcp_response(int sock, struct dhcp_packet* recv_pkt, int msg_type) {
+    struct sockaddr_in client_addr;
+    memset(&client_addr, 0, sizeof(client_addr));
+    client_addr.sin_family = AF_INET;
+    client_addr.sin_port = htons(DHCP_CLIENT_PORT);
+    client_addr.sin_addr.s_addr = inet_addr("255.255.255.255"); // 广播
+
+    // 构造响应报文
+    struct dhcp_packet resp_pkt;
+    memset(&resp_pkt, 0, sizeof(resp_pkt));
+    resp_pkt.op = 2;                // 响应报文
+    resp_pkt.htype = 1;             // 以太网
+    resp_pkt.hlen = 6;              // MAC地址长度
+    resp_pkt.xid = recv_pkt->xid;   // 复用客户端事务ID
+    resp_pkt.yiaddr = inet_addr(ASSIGN_IP); // 分配固定IP
+    resp_pkt.siaddr = inet_addr(SERVER_IP);
+    memcpy(resp_pkt.chaddr, recv_pkt->chaddr, 16); // 客户端MAC
+
+    // 填充DHCP选项
+    uint8_t* opt = resp_pkt.options;
+    *opt++ = 53; *opt++ = 1; *opt++ = msg_type; // 消息类型
+    *opt++ = 1; *opt++ = 4; memcpy(opt, inet_addr(NETMASK), 4); opt +=4; // 掩码
+    *opt++ = 3; *opt++ = 4; memcpy(opt, inet_addr(GATEWAY), 4); opt +=4; // 网关
+    *opt++ = 6; *opt++ = 4; memcpy(opt, inet_addr(DNS), 4); opt +=4; // DNS
+    *opt++ = 255; // 结束符
+
+    // 广播发送响应
+    sendto(sock, (char*)&resp_pkt, sizeof(resp_pkt), 0,
+           (struct sockaddr*)&client_addr, sizeof(client_addr));
+}
+
+int main() {
+#ifdef _WIN32
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2,2), &wsa);
+#endif
+
+    // 创建UDP套接字
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) {
+        printf("套接字创建失败！\n");
+        return -1;
+    }
+
+    // 允许广播
+    int broadcast = 1;
+    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, (char*)&broadcast, sizeof(broadcast));
+
+    // 绑定67端口
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(DHCP_SERVER_PORT);
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        printf("绑定端口失败！请用管理员/root权限运行！\n");
+        return -1;
+    }
+
+    printf("===== 简易DHCP服务器已启动 =====\n");
+    printf("固定分配IP: %s\n", ASSIGN_IP);
+    printf("监听子网: 192.168.1.0/24\n");
+    printf("等待客户端请求...\n\n");
+
+    // 循环处理请求
+    struct dhcp_packet recv_pkt;
+    struct sockaddr_in client;
+    socklen_t len = sizeof(client);
+
+    while (1) {
+        memset(&recv_pkt, 0, sizeof(recv_pkt));
+        recvfrom(sock, (char*)&recv_pkt, sizeof(recv_pkt), 0,
+                 (struct sockaddr*)&client, &len);
+
+        // 解析DHCP消息类型
+        uint8_t msg_type = 0;
+        uint8_t* opt = recv_pkt.options;
+        while (*opt != 255) {
+            if (*opt == 53) { msg_type = *(opt+2); break; }
+            opt += *(opt+1) + 2;
+        }
+
+        // 处理Discover → 发送Offer
+        if (msg_type == 1) {
+            printf("收到客户端 DHCP Discover\n");
+            send_dhcp_response(sock, &recv_pkt, 2);
+            printf("发送 DHCP Offer → 分配IP: %s\n\n", ASSIGN_IP);
+        }
+
+        // 处理Request → 发送Ack
+        if (msg_type == 3) {
+            printf("收到客户端 DHCP Request\n");
+            send_dhcp_response(sock, &recv_pkt, 5);
+            printf("发送 DHCP Ack → IP分配成功！\n\n");
+        }
+    }
+
+#ifdef _WIN32
+    closesocket(sock);
+    WSACleanup();
+#else
+    close(sock);
+#endif
+    return 0;
+}
