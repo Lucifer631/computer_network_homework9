@@ -1,0 +1,91 @@
+#ifdef _WIN32
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+    #pragma comment(lib, "ws2_32.lib")
+#else
+    #include <sys/socket.h>
+    #include <netinet/ip.h>
+    #include <netinet/ip_icmp.h>
+    #include <arpa/inet.h>
+    #include <unistd.h>
+#endif
+
+#include <stdio.h>
+#include <string.h>
+
+uint16_t checksum(uint16_t* buf, int len) {
+    uint32_t sum = 0;
+    while (len > 1) {
+        sum += *buf++;
+        len -= 2;
+    }
+    if (len == 1) sum += *(uint8_t*)buf;
+    sum = (sum >> 16) + (sum & 0xFFFF);
+    sum += (sum >> 16);
+    return (uint16_t)(~sum);
+}
+
+struct icmp_packet {
+    uint8_t type;
+    uint8_t code;
+    uint16_t checksum;
+    uint16_t id;
+    uint16_t seq;
+    char data[32];
+};
+
+int main() {
+#ifdef _WIN32
+    WSADATA wsaData;
+    WSAStartup(MAKEWORD(2, 2), &wsaData);
+#endif
+
+    int sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (sock < 0) {
+        printf("错误：请用管理员/root权限运行！\n");
+        return -1;
+    }
+
+    printf("ICMP Ping 服务器已启动，等待系统Ping请求...\n");
+    printf("按 Ctrl+C 退出\n\n");
+
+    char buf[1024];
+    while (1) {
+        struct sockaddr_in from;
+        socklen_t from_len = sizeof(from);
+        int len = recvfrom(sock, buf, sizeof(buf), 0, (struct sockaddr*)&from, &from_len);
+
+        if (len < sizeof(struct ip)) continue;
+
+#ifdef _WIN32
+        struct icmp_packet* icmp = (struct icmp_packet*)(buf + 20);
+#else
+        struct ip* ip_hdr = (struct ip*)buf;
+        int ip_hdr_len = ip_hdr->ip_hl * 4;
+        struct icmp_packet* icmp = (struct icmp_packet*)(buf + ip_hdr_len);
+#endif
+
+        // 仅响应 ICMP Echo Request (类型8)
+        if (icmp->type == 8) {
+            printf("响应来自 %s 的Ping请求，序列号=%d\n",
+                inet_ntoa(from.sin_addr), icmp->seq);
+
+            // 构造应答包：类型改为0
+            icmp->type = 0;
+            icmp->checksum = 0;
+            icmp->checksum = checksum((uint16_t*)icmp, sizeof(struct icmp_packet));
+
+            // 回复给客户端
+            sendto(sock, (char*)icmp, sizeof(struct icmp_packet), 0,
+                (struct sockaddr*)&from, sizeof(from));
+        }
+    }
+
+#ifdef _WIN32
+    closesocket(sock);
+    WSACleanup();
+#else
+    close(sock);
+#endif
+    return 0;
+}
